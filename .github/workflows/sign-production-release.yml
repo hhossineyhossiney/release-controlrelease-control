@@ -1,0 +1,146 @@
+name: Sign verified ALOOKHOR production artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful main push build run ID from the private alookhor-store repository
+        required: true
+        type: string
+      source_sha:
+        description: Full 40-character source commit SHA from private main
+        required: true
+        type: string
+      confirm_sha:
+        description: Re-enter the exact source SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  deployments: read
+
+concurrency:
+  group: alookhor-production-signing
+  cancel-in-progress: false
+
+jobs:
+  sign-production:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production-signing
+    permissions:
+      contents: read
+      actions: read
+      deployments: read
+    steps:
+      - name: Fail closed unless production signing has been explicitly prepared
+        env:
+          SIGNING_GATE_READY: ${{ vars.VPS_PRODUCTION_SIGNING_READY }}
+          PUBLIC_KEY_PIN: ${{ vars.PRODUCTION_RELEASE_PUBLIC_KEY_SHA256 }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          CONFIRM_SHA: ${{ inputs.confirm_sha }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_TOKEN: ${{ secrets.ALOOKHOR_SOURCE_READ_TOKEN }}
+          SIGNING_KEY: ${{ secrets.PRODUCTION_RELEASE_SIGNING_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$GITHUB_REF" == refs/heads/main ]] || { echo 'Signing is restricted to control-repo main.' >&2; exit 1; }
+          [[ "$SIGNING_GATE_READY" == true ]] || { echo 'Blocked: configure and independently review the protected production-signing environment before enabling VPS_PRODUCTION_SIGNING_READY.' >&2; exit 1; }
+          [[ "$PUBLIC_KEY_PIN" =~ ^[a-f0-9]{64}$ ]] || { echo 'Blocked: a separately verified public-key SHA-256 pin is required.' >&2; exit 1; }
+          [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]] || { echo 'A valid source run ID is required.' >&2; exit 1; }
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ && "$CONFIRM_SHA" == "$SOURCE_SHA" ]] || { echo 'The full source SHA and confirmation must match.' >&2; exit 1; }
+          [[ -n "$SOURCE_TOKEN" ]] || { echo 'The private-source read token is not configured.' >&2; exit 1; }
+          [[ -n "$SIGNING_KEY" ]] || { echo 'The production signing private key is not configured in the protected environment.' >&2; exit 1; }
+      - name: Verify independent approval and main-only environment policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          environment_json="$(gh api "repos/$GITHUB_REPOSITORY/environments/production-signing")"
+          policies_json="$(gh api "repos/$GITHUB_REPOSITORY/environments/production-signing/deployment-branch-policies")"
+          jq -cn --argjson environment "$environment_json" --argjson policies "$policies_json" \
+            '{environment:$environment,branch_policies:$policies.branch_policies}' \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const p=JSON.parse(s);const e=p.environment;const rule=(e.protection_rules||[]).find(x=>x.type==="required_reviewers");const reviewers=rule?.reviewers||[];const independent=reviewers.some(x=>["User","Team"].includes(x.type)&&(typeof x.reviewer?.id==="number"||typeof x.reviewer?.login==="string"||typeof x.reviewer?.slug==="string"));const b=e.deployment_branch_policy;const policies=p.branch_policies;if(e.name!=="production-signing"||!rule||rule.prevent_self_review!==true||!independent||b?.custom_branch_policies!==true||b?.protected_branches!==false||!Array.isArray(policies)||policies.length!==1||policies[0].type!=="branch"||policies[0].name!=="main"){console.error("BLOCKED: production-signing must require an independent reviewer, prevent self-review, and allow only main.");process.exit(1)}console.log("Verified independent reviewer, self-review prevention, and main-only policy.")})'
+      - name: Check out exact private source commit and verifier scripts
+        uses: actions/checkout@v4
+        with:
+          repository: hhossineyhossiney/alookhor-store
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.ALOOKHOR_SOURCE_READ_TOKEN }}
+          persist-credentials: false
+      - name: Verify exact successful private main build run and artifact metadata
+        id: source
+        env:
+          EXPECTED_SHA: ${{ inputs.source_sha }}
+          EXPECTED_BRANCH: main
+          VPS_RUN_ID: ${{ inputs.source_run_id }}
+          GITHUB_REPOSITORY: hhossineyhossiney/alookhor-store
+          GITHUB_TOKEN: ${{ secrets.ALOOKHOR_SOURCE_READ_TOKEN }}
+        run: node scripts/verify-vps-run.mjs
+      - name: Download artifact from the exact private source run
+        uses: actions/download-artifact@v4
+        with:
+          name: alookhor-vps-${{ inputs.source_sha }}
+          run-id: ${{ inputs.source_run_id }}
+          repository: hhossineyhossiney/alookhor-store
+          github-token: ${{ secrets.ALOOKHOR_SOURCE_READ_TOKEN }}
+          path: source-artifact
+      - name: Validate archive contents, internal checksums, branch, SHA and API layout
+        id: package
+        env:
+          EXPECTED_SHA: ${{ inputs.source_sha }}
+          EXPECTED_BRANCH: main
+          EXPECTED_API_BASE_URL: /api/v1
+          ARTIFACT_DIR: source-artifact
+        run: node scripts/verify-vps-artifact.mjs
+      - name: Sign production manifest and verify signature, pin and archive
+        env:
+          PRODUCTION_RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.PRODUCTION_RELEASE_SIGNING_PRIVATE_KEY }}
+          PUBLIC_KEY_PIN: ${{ vars.PRODUCTION_RELEASE_PUBLIC_KEY_SHA256 }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_ARCHIVE_NAME: ${{ steps.package.outputs.archive_name }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          trap 'rm -f -- signing-private.pem' EXIT
+          [[ -n "$PRODUCTION_RELEASE_SIGNING_PRIVATE_KEY" ]] || { echo 'The protected signing key is not configured.' >&2; exit 1; }
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]] || { echo 'Source SHA is invalid.' >&2; exit 1; }
+          [[ "$SOURCE_ARCHIVE_NAME" =~ ^[A-Za-z0-9._-]+-${SOURCE_SHA:0:12}\.tar\.gz$ ]] || { echo 'Archive name does not bind to the selected SHA.' >&2; exit 1; }
+          mkdir -m 700 production-bundle
+          install -m 600 -- "source-artifact/$SOURCE_ARCHIVE_NAME" production-bundle/alookhor-production.tar.gz
+          digest="$(sha256sum production-bundle/alookhor-production.tar.gz | awk '{print $1}')"
+          jq -cn \
+            --arg schema alookhor-release-manifest-v1 \
+            --arg target production \
+            --arg repository hhossineyhossiney/alookhor-store \
+            --arg commit_sha "$SOURCE_SHA" \
+            --arg archive_name alookhor-production.tar.gz \
+            --arg sha256 "$digest" \
+            '{schema:$schema,target:$target,repository:$repository,commit_sha:$commit_sha,archive_name:$archive_name,sha256:$sha256}' \
+            > production-bundle/manifest.json
+          printf '%s' "$PRODUCTION_RELEASE_SIGNING_PRIVATE_KEY" > signing-private.pem
+          chmod 600 signing-private.pem
+          openssl pkey -in signing-private.pem -pubout -out production-bundle/signing-public.pem
+          actual_pin="$(openssl pkey -pubin -in production-bundle/signing-public.pem -outform DER | sha256sum | awk '{print $1}')"
+          [[ "$actual_pin" == "$PUBLIC_KEY_PIN" ]] || { echo 'Signing key does not match the independently pinned public key.' >&2; exit 1; }
+          openssl dgst -sha256 -sign signing-private.pem -out production-bundle/manifest.sig production-bundle/manifest.json
+          python3 scripts/verify_production_release.py \
+            --manifest production-bundle/manifest.json \
+            --signature production-bundle/manifest.sig \
+            --archive production-bundle/alookhor-production.tar.gz \
+            --public-key production-bundle/signing-public.pem
+          rm -f -- signing-private.pem
+          echo "Production-signed artifact verified for $SOURCE_SHA. No server connection or deployment was performed."
+      - name: Upload exact signed bundle for later, separately approved release handling
+        uses: actions/upload-artifact@v4
+        with:
+          name: alookhor-production-signed-${{ inputs.source_sha }}
+          path: production-bundle/**
+          if-no-files-found: error
+          retention-days: 90
