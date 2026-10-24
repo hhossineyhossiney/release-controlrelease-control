@@ -81,6 +81,7 @@ jobs:
           VPS_RUN_ID: ${{ inputs.source_run_id }}
           SOURCE_REPOSITORY: hhossineyhossiney/alookhor-store
           SOURCE_READ_TOKEN: ${{ secrets.ALOOKHOR_SOURCE_READ_TOKEN }}
+          SOURCE_WORKFLOW_PATH: .github/workflows/build.yml
         run: node scripts/verify-vps-run.mjs
       - name: Check out exact private source commit and verifier scripts
         uses: actions/checkout@v4

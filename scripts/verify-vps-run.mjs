@@ -9,13 +9,18 @@
  *   VPS_RUN_ID         Actions run ID of the successful private main push build
  *   EXPECTED_SHA       full 40-character lowercase commit SHA the run must be pinned to
  *   EXPECTED_BRANCH    branch the run must be on (expected "main")
+ *   SOURCE_WORKFLOW_PATH  workflow path the run must belong to (expected ".github/workflows/build.yml")
  *
  * Using the GitHub REST API only, the script verifies:
+ *   - the run belongs to the exact expected workflow (matched by workflow_id against the
+ *     workflow registered at SOURCE_WORKFLOW_PATH in the source repository)
+ *   - the run's head_repository is the configured source repository
  *   - the run exists and is a completed, successful push on the expected branch and SHA
  *   - exactly one non-expired artifact named "alookhor-vps-<EXPECTED_SHA>" exists on that run
  *
- * This verifies run and artifact metadata only. It does not download, inspect, sign, or
- * deploy the artifact. Exit code 0 on success; 1 with a clear message otherwise.
+ * Error messages identify the failing endpoint precisely and never include the token
+ * or any other secret. This verifies run and artifact metadata only. It does not download,
+ * inspect, sign, or deploy the artifact. Exit code 0 on success; 1 with a clear message otherwise.
  */
 
 import process from 'node:process';
@@ -23,10 +28,12 @@ import { pathToFileURL } from 'node:url';
 
 export const GITHUB_API_BASE = 'https://api.github.com';
 export const ARTIFACT_NAME_PREFIX = 'alookhor-vps-';
+export const DEFAULT_WORKFLOW_PATH = '.github/workflows/build.yml';
 
 const REPOSITORY_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])\/[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])$/;
 const RUN_ID_PATTERN = /^[1-9][0-9]{0,19}$/;
 const SHA_PATTERN = /^[a-f0-9]{40}$/;
+const WORKFLOW_PATH_PATTERN = /^\.github\/workflows\/[A-Za-z0-9._-]+\.ya?ml$/;
 
 class VerificationError extends Error {}
 
@@ -39,6 +46,13 @@ function artifactNameFor(sha) {
   return `${ARTIFACT_NAME_PREFIX}${sha}`;
 }
 
+/** Per-endpoint hint appended to precise 404 messages. */
+const NOT_FOUND_HINTS = {
+  'Source run': 'Confirm the run ID and the token\'s read access to the source repository.',
+  'Artifacts list': 'The run may not exist or may have no artifacts.',
+  'Workflow list': 'Confirm the token\'s read access to the source repository.',
+};
+
 /**
  * Validate the required environment contract.
  * Returns a normalized object on success; throws VerificationError otherwise.
@@ -49,6 +63,7 @@ function checkEnv(env = process.env) {
   const runId = String(env.VPS_RUN_ID ?? '').trim();
   const expectedSha = String(env.EXPECTED_SHA ?? '').trim();
   const expectedBranch = String(env.EXPECTED_BRANCH ?? '').trim();
+  const expectedWorkflowPath = String(env.SOURCE_WORKFLOW_PATH ?? DEFAULT_WORKFLOW_PATH).trim();
 
   if (!REPOSITORY_PATTERN.test(repository)) {
     fail('SOURCE_REPOSITORY must be a GitHub repository in "owner/name" form.');
@@ -65,12 +80,16 @@ function checkEnv(env = process.env) {
   if (!expectedBranch) {
     fail('EXPECTED_BRANCH must be set (expected "main").');
   }
+  if (!WORKFLOW_PATH_PATTERN.test(expectedWorkflowPath)) {
+    fail('SOURCE_WORKFLOW_PATH must be a workflow path in ".github/workflows/<name>.yml" form.');
+  }
 
-  return { repository, token, runId, expectedSha, expectedBranch };
+  return { repository, token, runId, expectedSha, expectedBranch, expectedWorkflowPath };
 }
 
-/** Authenticated GET against the GitHub REST API; returns the parsed JSON body. */
-async function githubApiGet(url, token, fetchImpl = fetch) {
+/** Authenticated GET against the GitHub REST API; returns the parsed JSON body.
+ *  Error messages name the failing endpoint (label) and never include credentials. */
+async function githubApiGet(url, token, fetchImpl = fetch, label = 'GitHub API') {
   let response;
   try {
     response = await fetchImpl(url, {
@@ -96,31 +115,49 @@ async function githubApiGet(url, token, fetchImpl = fetch) {
   if (status < 200 || status >= 300) {
     const detail = body && typeof body.message === 'string' ? body.message : `HTTP ${status}`;
     if (status === 401) {
-      fail(`The source read token was rejected (401): ${detail}`);
+      fail(`The source read token was rejected (401) while requesting the ${label} at ${url}: ${detail}`);
     }
     if (status === 403) {
-      fail(`The source read token lacks access or is rate limited (403): ${detail}`);
+      fail(`The source read token lacks access or is rate limited (403) while requesting the ${label} at ${url}: ${detail}`);
     }
     if (status === 404) {
-      fail(`Run not found at ${url} (404). Confirm the run ID and the token's read access to the source repository.`);
+      const hint = NOT_FOUND_HINTS[label] ?? 'Confirm the resource and the token\'s read access to the source repository.';
+      fail(`${label} not found at ${url} (404). ${hint}`);
     }
-    fail(`GitHub API request failed (${status}) for ${url}: ${detail}`);
+    fail(`GitHub API request failed (${status}) for the ${label} at ${url}: ${detail}`);
   }
 
   if (body === null) {
-    fail(`Unexpected empty response from the GitHub API at ${url}.`);
+    fail(`Unexpected empty response from the GitHub API for the ${label} at ${url}.`);
   }
 
   return body;
 }
 
 /**
+ * Resolve the workflow database ID registered at the expected workflow path in the
+ * source repository (first page, per_page=100). Throws VerificationError when absent.
+ */
+async function fetchExpectedWorkflowId({ repository, token, expectedWorkflowPath, apiBase = GITHUB_API_BASE, fetchImpl = fetch }) {
+  const workflowsUrl = `${apiBase}/repos/${repository}/actions/workflows?per_page=100`;
+  const body = await githubApiGet(workflowsUrl, token, fetchImpl, 'Workflow list');
+  const workflows = Array.isArray(body.workflows) ? body.workflows : [];
+  const workflow = workflows.find((entry) => entry.path === expectedWorkflowPath);
+  if (!workflow) {
+    fail(`Workflow "${expectedWorkflowPath}" was not found in ${repository}. The configured source build workflow must exist in the source repository.`);
+  }
+  return workflow.id;
+}
+
+/**
  * Verify the exact source run and its artifact metadata.
  * Throws VerificationError on any mismatch; returns a summary object on success.
  */
-async function verifyRun({ repository, token, runId, expectedSha, expectedBranch, apiBase = GITHUB_API_BASE, fetchImpl = fetch }) {
+async function verifyRun({ repository, token, runId, expectedSha, expectedBranch, expectedWorkflowPath, apiBase = GITHUB_API_BASE, fetchImpl = fetch }) {
+  const expectedWorkflowId = await fetchExpectedWorkflowId({ repository, token, expectedWorkflowPath, apiBase, fetchImpl });
+
   const runUrl = `${apiBase}/repos/${repository}/actions/runs/${runId}`;
-  const run = await githubApiGet(runUrl, token, fetchImpl);
+  const run = await githubApiGet(runUrl, token, fetchImpl, 'Source run');
 
   const problems = [];
   if (run.status !== 'completed') {
@@ -138,12 +175,23 @@ async function verifyRun({ repository, token, runId, expectedSha, expectedBranch
   if (run.head_sha !== expectedSha) {
     problems.push(`run head SHA is "${run.head_sha}", expected "${expectedSha}"`);
   }
+  if (run.workflow_id === null || run.workflow_id === undefined) {
+    problems.push('run has no workflow_id; cannot verify the source workflow');
+  } else if (Number(run.workflow_id) !== Number(expectedWorkflowId)) {
+    problems.push(`run belongs to workflow_id ${run.workflow_id}, expected ${expectedWorkflowId} for workflow "${expectedWorkflowPath}"`);
+  }
+  const headRepositoryFullName = run.head_repository?.full_name;
+  if (!headRepositoryFullName) {
+    problems.push('run has no head_repository; cannot verify the source repository');
+  } else if (headRepositoryFullName !== repository) {
+    problems.push(`run head repository is "${headRepositoryFullName}", expected "${repository}"`);
+  }
   if (problems.length > 0) {
     fail(`Source run ${runId} does not match the required private main build:\n  - ${problems.join('\n  - ')}`);
   }
 
   const expectedArtifactName = artifactNameFor(expectedSha);
-  const artifactsBody = await githubApiGet(`${runUrl}/artifacts?per_page=100`, token, fetchImpl);
+  const artifactsBody = await githubApiGet(`${runUrl}/artifacts?per_page=100`, token, fetchImpl, 'Artifacts list');
   const artifacts = Array.isArray(artifactsBody.artifacts) ? artifactsBody.artifacts : [];
   const matching = artifacts.filter((artifact) => artifact.name === expectedArtifactName && artifact.expired === false);
   if (matching.length !== 1) {
@@ -151,9 +199,12 @@ async function verifyRun({ repository, token, runId, expectedSha, expectedBranch
   }
 
   return {
+    expectedWorkflowPath,
+    expectedWorkflowId,
     run: {
       id: run.id,
       name: run.name,
+      workflow_id: run.workflow_id,
       event: run.event,
       status: run.status,
       conclusion: run.conclusion,
@@ -166,9 +217,9 @@ async function verifyRun({ repository, token, runId, expectedSha, expectedBranch
 }
 
 function formatSummary(result) {
-  const { run, artifact } = result;
+  const { run, artifact, expectedWorkflowPath, expectedWorkflowId } = result;
   return [
-    `Verified run ${run.id}: ${run.event} on ${run.head_branch} at ${run.head_sha} (${run.status}/${run.conclusion}).`,
+    `Verified run ${run.id}: ${run.event} on ${run.head_branch} at ${run.head_sha} (${run.status}/${run.conclusion}) from workflow "${expectedWorkflowPath}" (workflow_id ${expectedWorkflowId}).`,
     `Verified exactly one non-expired artifact "${artifact.name}" (${artifact.size_in_bytes} bytes, created ${artifact.created_at}).`,
     'This verifies run and artifact metadata only. It does not download, inspect, sign, or deploy the artifact.',
   ];
@@ -195,4 +246,4 @@ if (isDirectRun) {
   });
 }
 
-export { VerificationError, checkEnv, artifactNameFor, githubApiGet, verifyRun, main };
+export { VerificationError, checkEnv, artifactNameFor, githubApiGet, fetchExpectedWorkflowId, verifyRun, main };
