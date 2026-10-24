@@ -1,0 +1,13 @@
+{
+  "name": "alookhor-release-control",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Release-control plane for verified ALOOKHOR production artifacts",
+  "type": "module",
+  "scripts": {
+    "test": "node --test scripts/"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

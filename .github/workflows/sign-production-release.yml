@@ -66,12 +66,12 @@ jobs:
           jq -cn --argjson environment "$environment_json" --argjson policies "$policies_json" \
             '{environment:$environment,branch_policies:$policies.branch_policies}' \
             | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const p=JSON.parse(s);const e=p.environment;const rule=(e.protection_rules||[]).find(x=>x.type==="required_reviewers");const reviewers=rule?.reviewers||[];const independent=reviewers.some(x=>["User","Team"].includes(x.type)&&(typeof x.reviewer?.id==="number"||typeof x.reviewer?.login==="string"||typeof x.reviewer?.slug==="string"));const b=e.deployment_branch_policy;const policies=p.branch_policies;if(e.name!=="production-signing"||!rule||rule.prevent_self_review!==true||!independent||b?.custom_branch_policies!==true||b?.protected_branches!==false||!Array.isArray(policies)||policies.length!==1||policies[0].type!=="branch"||policies[0].name!=="main"){console.error("BLOCKED: production-signing must require an independent reviewer, prevent self-review, and allow only main.");process.exit(1)}console.log("Verified independent reviewer, self-review prevention, and main-only policy.")})'
-      - name: Check out exact private source commit and verifier scripts
+      # Verify the exact source run with the control repository's own verifier script
+      # before checking out the private source commit (the source checkout cleans
+      # the workspace and would otherwise shadow the control repository scripts).
+      - name: Check out control repository
         uses: actions/checkout@v4
         with:
-          repository: hhossineyhossiney/alookhor-store
-          ref: ${{ inputs.source_sha }}
-          token: ${{ secrets.ALOOKHOR_SOURCE_READ_TOKEN }}
           persist-credentials: false
       - name: Verify exact successful private main build run and artifact metadata
         id: source
@@ -79,9 +79,16 @@ jobs:
           EXPECTED_SHA: ${{ inputs.source_sha }}
           EXPECTED_BRANCH: main
           VPS_RUN_ID: ${{ inputs.source_run_id }}
-          GITHUB_REPOSITORY: hhossineyhossiney/alookhor-store
-          GITHUB_TOKEN: ${{ secrets.ALOOKHOR_SOURCE_READ_TOKEN }}
+          SOURCE_REPOSITORY: hhossineyhossiney/alookhor-store
+          SOURCE_READ_TOKEN: ${{ secrets.ALOOKHOR_SOURCE_READ_TOKEN }}
         run: node scripts/verify-vps-run.mjs
+      - name: Check out exact private source commit and verifier scripts
+        uses: actions/checkout@v4
+        with:
+          repository: hhossineyhossiney/alookhor-store
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.ALOOKHOR_SOURCE_READ_TOKEN }}
+          persist-credentials: false
       - name: Download artifact from the exact private source run
         uses: actions/download-artifact@v4
         with:
